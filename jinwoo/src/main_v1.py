@@ -1,0 +1,159 @@
+import cv2
+import numpy as np
+import pytesseract
+import os
+import glob
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+
+# tesseract 설치
+# https://github.com/UB-Mannheim/tesseract/wiki
+
+# Tesseract OCR 엔진 경로 설정 (사용자의 설치 경로에 맞게 수정)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+def find_glare_mask(image):
+    """HSV 색 공간과 모폴로지 연산을 이용해 글레어 마스크를 생성합니다."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # V(value)가 높고 S(saturation)가 낮은 영역을 반사광으로 간주합니다.
+    lower_glare = np.array([0, 0, 180], dtype=np.uint8)
+    upper_glare = np.array([179, 70, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower_glare, upper_glare)
+    
+    # 작은 노이즈 제거를 위해 모폴로지 연산 적용
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+def align_images(image1, image2):
+    """ORB 특징점을 이용해 이미지2를 이미지1에 정합합니다."""
+    orb = cv2.ORB_create(nfeatures=2000)
+    kp1, des1 = orb.detectAndCompute(image1, None)
+    kp2, des2 = orb.detectAndCompute(image2, None)
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    # 충분한 매칭점이 있을 때만 호모그래피 계산
+    if len(matches) > 10:
+        src_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_image = cv2.warpPerspective(image2, M, (image1.shape[1], image1.shape[0]))
+        return aligned_image
+    else:
+        return None
+
+def main(input_folder, output_folder):
+    """
+    메인 파이프라인 실행 함수.
+    """
+    print("✨ 無色無光: 반사광 제거 문서 스캐너 프로젝트 시작!")
+
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    image_paths = sorted(glob.glob(os.path.join(input_folder, '*.jpg')))
+    if not image_paths:
+        print("입력 폴더에 .jpg 이미지가 없습니다. 이미지를 추가해주세요.")
+        return
+
+    # 첫 번째 이미지를 기준 프레임으로 설정
+    base_image = cv2.imread(image_paths[0])
+    
+    aligned_images = [base_image]
+    # 프레임 정합
+    for i in range(1, len(image_paths)):
+        img = cv2.imread(image_paths[i])
+        aligned = align_images(base_image, img)
+        if aligned is not None:
+            aligned_images.append(aligned)
+        else:
+            print(f"이미지 {os.path.basename(image_paths[i])} 정합 실패, 원본 사용.")
+            aligned_images.append(img)
+            
+    # 멀티프레임 합성 (반사광 제거)
+    final_image = np.zeros_like(base_image, dtype=np.float32)
+    glare_masks = [find_glare_mask(img) for img in aligned_images]
+
+    for i in range(base_image.shape[0]):
+        for j in range(base_image.shape[1]):
+            best_pixel = None
+            best_glare_metric = float('inf')
+
+            # 각 프레임의 픽셀을 비교하여 반사광이 가장 적은 픽셀 선택
+            for k in range(len(aligned_images)):
+                is_glare = glare_masks[k][i, j]
+                if is_glare == 0:  # 반사광이 없는 픽셀
+                    best_pixel = aligned_images[k][i, j]
+                    break
+            
+            if best_pixel is None:
+                # 모든 프레임에 반사광이 있다면, 중간값 픽셀을 선택
+                pixels = [img[i, j] for img in aligned_images]
+                best_pixel = np.median(pixels, axis=0)
+
+            final_image[i, j] = best_pixel
+
+    final_image = final_image.astype(np.uint8)
+
+    # 후처리: CLAHE 적용
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    lab_image = cv2.cvtColor(final_image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab_image)
+    l_clahe = clahe.apply(l)
+    lab_clahe = cv2.merge((l_clahe, a, b))
+    result_image = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+
+    # 결과 저장
+    result_path = os.path.join(output_folder, 'test_ex_result.jpg')
+    cv2.imwrite(result_path, result_image)
+    print(f"✅ 최종 결과 이미지가 '{result_path}'에 저장되었습니다.")
+
+    # 평가 및 리포트
+    # ----------------
+    # pytesseract는 tesseract.exe가 설치되어 있어야 동작합니다.
+    # ----------------
+    print("\n--- OCR 성능 평가 및 품질지표 계산 ---")
+    base_gray = cv2.cvtColor(base_image, cv2.COLOR_BGR2GRAY)
+    result_gray = cv2.cvtColor(result_image, cv2.COLOR_BGR2GRAY)
+
+    # PSNR/SSIM 계산
+    psnr_value = psnr(base_gray, result_gray)
+    ssim_value = ssim(base_gray, result_gray, data_range=result_gray.max() - result_gray.min())
+    print(f"PSNR (원본 대비): {psnr_value:.2f} dB")
+    print(f"SSIM (원본 대비): {ssim_value:.4f}")
+
+    # OCR 결과를 위한 전처리 강화
+    # 1. 노이즈 제거
+    denoised_base = cv2.fastNlMeansDenoising(base_gray, None, 10, 7, 21)
+    denoised_result = cv2.fastNlMeansDenoising(result_gray, None, 10, 7, 21)
+
+    # 2. 이미지 확대 (OCR 정확도 향상)
+    upscaled_base = cv2.resize(denoised_base, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    upscaled_result = cv2.resize(denoised_result, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    
+    # 3. 적응형 이진화 (글자와 배경을 명확히 분리)
+    binarized_base = cv2.adaptiveThreshold(upscaled_base, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4)
+    binarized_result = cv2.adaptiveThreshold(upscaled_result, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4)
+
+    # OCR 결과
+    try:
+        # OCR 설정 최적화 (페이지 분할 모드 6: 단일 균일 블록으로 처리)
+        custom_config = r'--oem 3 --psm 6'
+
+        original_text = pytesseract.image_to_string(binarized_base, lang='kor+eng', config=custom_config)
+        final_text = pytesseract.image_to_string(binarized_result, lang='kor+eng', config=custom_config)
+        
+        print("\n원본 이미지 OCR 결과:\n", "-"*20, "\n", original_text)
+        print("\n최종 결과 이미지 OCR 결과:\n", "-"*20, "\n", final_text)
+    except Exception as e:
+        print(f"OCR 실행 중 오류가 발생했습니다: {e}")
+        print("Tesseract 엔진이 올바르게 설치되었는지 확인하고, 위 코드의 'pytesseract.pytesseract.tesseract_cmd' 경로를 수정해주세요.")
+
+if __name__ == "__main__":
+    input_dir = 'images'
+    output_dir = 'results'
+    main(input_dir, output_dir)
