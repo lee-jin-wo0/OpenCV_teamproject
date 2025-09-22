@@ -1,0 +1,7 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.30,<0.32
+python-multipart>=0.0.9,<0.0.10
+pillow>=10,<11
+numpy==1.26.4
+opencv-python>=4.8,<4.11
+paddleocr==2.9.1
