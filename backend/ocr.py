@@ -203,4 +203,3 @@ def run_ocr_on_list(images_bgr):
             texts.append(t)
         all_boxes.extend(b)
     return " ".join(texts).strip(), all_boxes
-

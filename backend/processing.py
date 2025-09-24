@@ -355,4 +355,3 @@ def find_grid_cells_3x3(bgr, debug=False):
                 cells.append(warp[y1:y2, x1:x2].copy())
 
     return cells if len(cells) >= 6 else []
-
